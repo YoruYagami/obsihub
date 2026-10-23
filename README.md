@@ -29,6 +29,60 @@ The setup installs the script to `~/.local/bin/vault-sync`, so the cloned folder
 
 ---
 
+## Cheat sheet
+
+Day to day there is nothing to do: write in Obsidian, the timer handles the rest.
+
+```bash
+vs                    # sync now (before shutting down, before switching machines)
+vault-sync status     # is everything OK? key, GitHub access, pending commits, timer, last sync
+vsetup                # change a setting, or fix whatever broke: Enter keeps the current value
+
+vault-sync apply      # after editing ~/.config/vault-sync/config by hand
+journalctl --user -u vault-sync.service -n 20     # what the automatic runs did
+cd obsihub && git pull && ./vault-sync apply      # update to the latest version
+```
+
+**In the guided setup:** a number or letter picks an option · **Enter** keeps the current value · **r** starts over · **q** quits without saving.
+
+**When it tells you something** — at shell start, in a notification or after `vs`:
+
+| Message | Fix |
+|---|---|
+| `GitHub rejects SSH key …` | `vsetup`, Enter up to step 3, add the key it shows on GitHub, Enter to check again |
+| `the deploy key is read-only` | GitHub → repository → Settings → Deploy keys: delete the key, then `vsetup` shows it again to add with **Allow write access** ticked |
+| `… has no permission to push to it` | that account can only read the repository: use the dedicated deploy key (`vsetup`, step 3) |
+| `repository … does not exist or the key cannot access it` | check the name in `vsetup` step 2; a deploy key works for one repository only |
+| `SSH key … does not exist` | `vsetup` creates a new one |
+| `github.com did not show GitHub's official host key` | try another network; if it happens everywhere, GitHub changed its key: update vault-sync |
+| `CONFLICT in note.md` | `cd ~/Vault && git merge origin/main`, fix the notes in Obsidian, then `vs` |
+| `conflict markers still in note.md` | remove the `<<<<<<<` … `>>>>>>>` blocks left in those notes, then `vs` |
+| `a rebase or cherry-pick was left half-done` | `cd ~/Vault && git status` says how to finish or abort it, then `vs` |
+| `there are unresolved conflicts` | fix the files `git status` lists, `git add` them, then `vs` |
+| `you are not on a branch (detached HEAD)` | `cd ~/Vault && git switch main`, then `vs` |
+| `on GitHub the vault is on branch main, here on master` | `cd ~/Vault && git branch -m master main`, then `vs` |
+| `… have nothing in common` | make sure the repository really is this vault; if it is: `cd ~/Vault && git merge --allow-unrelated-histories origin/main`, fix any conflict, then `vs` |
+| `refusing to sync ~` · `is not a git repository of its own` | `vsetup`, and pick the vault's own folder |
+| `files too big for GitHub (over 100 MB)` | move the file out of the vault, or add it to `.gitignore` |
+| `… because it is a nested git repository` | move that folder out of the vault, or delete its `.git` folder |
+| `git is locked by a leftover file` | if no other git is running on the vault: delete the file it names |
+| `GitHub unreachable` · `another git is working on the vault` · `… retrying next round` · `the sync was interrupted` | nothing: the next round retries by itself |
+| `automatic sync is off` | `vault-sync apply` |
+| `N commit(s) not on GitHub yet` | `vs` |
+
+**Where things live:**
+
+| Path | What |
+|---|---|
+| `~/.local/bin/vault-sync` | the script |
+| `~/.config/vault-sync/config` | settings |
+| `~/.config/vault-sync/github_known_hosts` | GitHub's official host key |
+| `~/.local/state/vault-sync/state` | outcome of the last sync |
+| `~/.config/systemd/user/vault-sync.{service,timer}` | the timer |
+| `~/.ssh/vault_ed25519` | the dedicated deploy key |
+
+---
+
 ## The guided setup
 
 `vault-sync configure` — `vsetup` once installed — is a wizard in the style of `p10k configure`: one page per question, one key per answer. **Enter keeps the current value**, `r` starts over, `q` quits without saving anything.
@@ -45,33 +99,27 @@ The setup installs the script to `~/.local/bin/vault-sync`, so the cloned folder
 
 The only step that needs a human is the key. If GitHub doesn't accept it yet, the wizard shows the public key, copies it to the clipboard, opens the right GitHub page (the repository's *Deploy keys*, or your account's *SSH keys*) and checks again when you press Enter.
 
+That check covers **writing**, not just reading: a deploy key added without *Allow write access* can read the repository, so everything would look fine — until the first push.
+
+The wizard also keeps you from the mistakes that leak data:
+
+- it refuses your home folder, the folders above it, and any folder holding SSH or GPG keys: syncing them would push your keys to GitHub;
+- it asks before turning a folder that sits inside another git repository into the vault, because that means syncing the whole repository;
+- it warns you if the GitHub repository is **public**, before anything is pushed.
+
 Once you confirm, it:
 
-- clones the vault, or creates the repository, or — if the folder already holds notes and GitHub already holds a vault — merges the two without losing either side;
+- clones the vault, or creates the repository, or — if the folder already holds notes and GitHub already holds a vault — merges the two: where a note differs, GitHub's version stays and yours is kept next to it as `note (local).md`, while Obsidian's settings come from GitHub;
 - installs itself to `~/.local/bin/vault-sync`;
 - configures git in the vault: `origin`, the key (also used by manual `git` commands), an identity if none is set, `pull.rebase false`;
 - adds the [ignore rules](#what-stays-out-of-git) to `.gitignore`;
 - installs the systemd timer and enables lingering;
 - adds `vs`, `vsetup` and the shell warning to `~/.zshrc` (or `~/.bashrc`);
-- runs a first real sync, then proves that GitHub accepts **pushes** from the key, not just reads.
-
-That last check is not cosmetic: a deploy key added without *Allow write access* can read the repository, so everything looks fine — until the first push.
+- runs a first real sync.
 
 **When something breaks, run `vsetup` again.** Every page starts from the current value: it's Enter, Enter, … and only the broken step needs attention.
 
 Settings live in `~/.config/vault-sync/config`. You can also edit that file by hand and then run `vault-sync apply`.
-
----
-
-## Day-to-day use
-
-None. Write in Obsidian, the timer handles the rest.
-
-| Command | |
-|---|---|
-| `vs` | sync right now — before shutting down, say |
-| `vault-sync status` | vault, key, GitHub access, pending commits, timer, last sync |
-| `vsetup` | reopen the guided setup |
 
 ---
 
@@ -89,11 +137,14 @@ The script handles four cases by comparing `HEAD`, `origin/<branch>` and their c
 If the automatic merge fails — same note, same lines, two machines — the script runs `git merge --abort`, **leaves the repository clean with your commits intact**, and fires a critical notification listing the files. You resolve it whenever you like:
 
 ```bash
-cd ~/Vault && git merge origin/main     # then fix the conflicting notes
-git commit -a && vs
+cd ~/Vault && git merge origin/main     # the conflicting notes now show both versions
+# fix them in Obsidian, then:
+vs                                      # completes the merge once no conflict markers are left
 ```
 
-A half-finished merge is never left behind for the next cycle to crash into, and while you are resolving one by hand the script refuses to run, so conflict markers never get committed by accident.
+A half-finished merge is never left behind for the next cycle to crash into, and while you are resolving one by hand the sync waits: as long as a conflicting note still has conflict markers it refuses to commit, so they never reach GitHub by accident.
+
+A new machine set up on an empty folder downloads the vault on its first sync. If the local branch name differs from GitHub's (`master` here, `main` there), the script stops and tells you how to rename it, instead of pushing a second branch that the other machines would never see.
 
 Commit messages include the hostname, so `git log` shows which machine each change came from.
 
@@ -101,27 +152,15 @@ Commit messages include the hostname, so `git log` shows which machine each chan
 
 ## When something goes wrong
 
-Every failure is reported in plain words, together with the fix:
+Every failure is reported in plain words, together with its fix (see the [cheat sheet](#cheat-sheet)). Some are prevented outright:
 
-| Situation | What happens |
-|---|---|
-| GitHub rejects the key | `GitHub rejects SSH key ~/.ssh/… → vsetup` |
-| Deploy key without write access | `the deploy key is read-only: on GitHub tick "Allow write access"` |
-| Offline | silence, unless it lasts more than a day |
-| Same note edited on two machines | `CONFLICT in note.md: nothing is lost. To resolve: …` |
-| Merge or rebase left half-done | the sync stops instead of committing conflict markers |
-| A file over 100 MB | kept out of the commit (GitHub would refuse it and block every later push); everything else syncs |
-| A git repository inside the vault | reported: git would store only a pointer to it, not its files |
+- **conflict markers are never committed**: the sync waits while a conflict is being resolved, and refuses to run during a half-done rebase;
+- **a file over 100 MB is kept out of the commit**, because GitHub would refuse it and block every later push — everything else still syncs;
+- **a git repository inside the vault is kept out and reported**, because git would store only a pointer to it, not its files (with a `.gitmodules`, submodules are left alone);
+- **your home folder, or a vault that is part of another repository, is never synced**;
+- **passing trouble is silent** — offline, the lid closed mid-sync, another git busy on the vault — unless it lasts more than a day.
 
-An error is notified once, then at most every 4 hours while it lasts — not every 15 minutes. The warning at shell start always shows the current problem, and `vault-sync status` gives the full picture.
-
-To dig deeper:
-
-```bash
-vault-sync status                                 # the whole picture, including GitHub access
-vs                                                # sync now, showing each step
-journalctl --user -u vault-sync.service -n 20     # logs of the automatic runs
-```
+An error is notified once, then at most every 4 hours while it lasts — not every 15 minutes. A new error replaces the previous notification instead of piling up, and when the sync works again the error notification turns into a short *✔ Vault synced again*, so a stale alarm never stays on screen. The warning at shell start always shows the current problem, and `vault-sync status` gives the full picture.
 
 ---
 
@@ -136,7 +175,7 @@ The setup adds these rules to the vault's `.gitignore`:
 | `**/.obsidian/plugins/obsidian-git/` | this project replaces the plugin |
 | `.trash/` | Obsidian's own bin |
 
-The rules start with `**/`, so they also match when the Obsidian vault is a subfolder of the repository. The rest of `.obsidian` stays tracked, so themes and plugins follow you across machines.
+The rules start with `**/`, so they also match when the Obsidian vault is a subfolder of the repository. A `workspace.json` that was already tracked is removed from the repository (the file stays on disk); the other rules only apply to new files. The rest of `.obsidian` stays tracked, so themes and plugins follow you across machines.
 
 ---
 
@@ -146,7 +185,9 @@ The rules start with `**/`, so they also match when the Obsidian vault is a subf
 
 **A deploy key by default.** It can reach the vault repository and nothing else, so a key sitting unencrypted on disk exposes your notes, not every repository you own.
 
-**Pinned GitHub host key.** The setup adds GitHub's published host key instead of trusting whatever answers the first connection.
+**Pinned GitHub host key, private ssh settings.** GitHub's published host key lives in a file of its own, and ssh runs with `-F /dev/null`: nothing in `~/.ssh/config` — a `Host *` with `StrictHostKeyChecking no`, an extra `IdentityFile` — can weaken the check or swap in another key. The flip side: host aliases and proxies from `~/.ssh/config` don't apply to the sync.
+
+**Independent of your git setup.** Git runs in English (its messages are parsed), and the sync overrides the settings that would break it unattended: `merge.ff=only`, commit signing, detached `gc`.
 
 **Merge rather than rebase.** With frequent auto-commits, a conflicted rebase forces you to resolve commit by commit. A merge concentrates everything into one place.
 
@@ -199,4 +240,4 @@ rm -r ~/.config/vault-sync ~/.local/state/vault-sync
 # remove the block between the vault-sync markers in ~/.zshrc
 ```
 
-Your vault and git repository are left untouched.
+If the setup enabled lingering and nothing else needs it: `loginctl disable-linger`. Your vault and git repository are left untouched.

@@ -11,8 +11,9 @@
 set -uo pipefail
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/vault-sync/config"
+KNOWN_HOSTS="${CONF%/*}/github_known_hosts"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/vault-sync/state"
-LOCK="${XDG_RUNTIME_DIR:-${STATE%/*}}/vault-sync.lock"
+LOCK="${STATE%/*}/lock"
 UNITS="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 BIN="$HOME/.local/bin/vault-sync"
 SELF=$(readlink -f "$0")
@@ -23,9 +24,12 @@ case "${SHELL##*/}" in bash) RC=$HOME/.bashrc ;; *) RC=${ZDOTDIR:-$HOME}/.zshrc 
 # defaults, overridden by the config
 VAULT_DIR="" VAULT_REMOTE="" VAULT_KEY="" VAULT_KEY_KIND=deploy VAULT_INTERVAL=15 VAULT_NOTIFY=all VAULT_SHELL=1
 [ -f "$CONF" ] && . "$CONF"
-# outcome of the last sync
-ST=ok ST_MSG="" ST_SINCE=0 ST_NOTIFIED=0 ST_LAST_OK=0
-[ -f "$STATE" ] && . "$STATE"
+
+load_state() {  # outcome of the last sync (ST_SOFT: the error is transient; ST_NID: its notification on screen, as id@daemon)
+    ST=ok ST_MSG="" ST_SOFT="" ST_SINCE=0 ST_NOTIFIED=0 ST_LAST_OK=0 ST_NID=""
+    if [ -f "$STATE" ]; then . "$STATE"; fi
+}
+load_state
 
 if [ -t 1 ]; then
     TTY=1 B=$'\e[1m' D=$'\e[2m' G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' C=$'\e[36m' N=$'\e[0m'
@@ -34,11 +38,13 @@ else
 fi
 
 # ---------------------------------------------------------------- helpers
-tilde() { printf '%s\n' "${1/#"$HOME"/\~}"; }
+tilde() { case $1 in "$HOME"|"$HOME"/*) printf '~%s\n' "${1#"$HOME"}" ;; *) printf '%s\n' "$1" ;; esac; }
+sq()    { printf "'%s'" "${1//\'/\'\\\'\'}"; }    # quoted for sh: git runs GIT_SSH_COMMAND and core.sshCommand through it
 say()   { [ "$TTY" = 1 ] && printf '%s\n' "$*"; return 0; }
 warn()  { printf '%s\n' "${Y}⚠ $*${N}" >&2; }
 die()   { printf '%s\n' "${R}✘ $*${N}" >&2; exit 1; }
 row()   { printf '  %-14s %s\n' "$1" "$2"; }
+list()  { head -n "${1:-5}" | paste -sd ',' | sed 's/,/, /g'; }   # lines -> "a, b, c"
 
 slug() { local s=${1#git@github.com:}; printf '%s\n' "${s%.git}"; }
 
@@ -50,23 +56,41 @@ norm_remote() {  # user/repo, GitHub https or ssh URL -> git@github.com:user/rep
     printf 'git@github.com:%s.git\n' "$r"
 }
 
-ssh_cmd() { printf 'ssh -i %q -o IdentitiesOnly=yes' "$1"; }
-
-# git and its children (ssh, background gc) must not inherit the lock on fd 9
-git() { command git "$@" 9>&-; }
-
-git_env() {  # ssh with no prompts and with timeouts: it must never hang
-    GIT_SSH_COMMAND="$(ssh_cmd "$1") -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
-    export GIT_SSH_COMMAND GIT_TERMINAL_PROMPT=0
-    # gc/maintenance in the foreground: detached, systemd would kill them when the service ends
-    export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=gc.autoDetach GIT_CONFIG_VALUE_0=false \
-           GIT_CONFIG_KEY_1=maintenance.autoDetach GIT_CONFIG_VALUE_1=false
+ssh_cmd() {  # ssh that ignores ~/.ssh/config: only the vault key, only GitHub's official host key
+    printf 'ssh -F /dev/null -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%s -o GlobalKnownHostsFile=/dev/null' \
+        "$(sq "$1")" "$(sq "$KNOWN_HOSTS")"
 }
 
-list() { head -n "${1:-5}" | paste -sd ',' | sed 's/,/, /g'; }   # lines -> "a, b, c"
+ensure_hostkey() {  # GitHub's host key in a file of our own: no blind trust on first use, and ~/.ssh is left alone
+    mkdir -p "${KNOWN_HOSTS%/*}" && printf '%s\n' "$GH_HOSTKEY" > "$KNOWN_HOSTS"
+}
+
+# git in English (its messages are parsed below), and without the lock on fd 9 (ssh and gc must not inherit it)
+git() { LC_ALL=C command git "$@" 9>&-; }
+
+git_env() {  # key — ssh with no prompts and with timeouts (it must never hang), and the git settings the sync relies on
+    [ -s "$KNOWN_HOSTS" ] || ensure_hostkey
+    GIT_SSH_COMMAND="$(ssh_cmd "$1") -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+    export GIT_SSH_COMMAND GIT_TERMINAL_PROMPT=0
+    # whatever the global git config says: gc in the foreground (detached, systemd would kill it when the service
+    # ends), real merges even with merge.ff=only, and no signing that nobody is there to unlock
+    export GIT_CONFIG_COUNT=5 \
+           GIT_CONFIG_KEY_0=gc.autoDetach          GIT_CONFIG_VALUE_0=false \
+           GIT_CONFIG_KEY_1=maintenance.autoDetach GIT_CONFIG_VALUE_1=false \
+           GIT_CONFIG_KEY_2=merge.ff               GIT_CONFIG_VALUE_2=true \
+           GIT_CONFIG_KEY_3=commit.gpgSign         GIT_CONFIG_VALUE_3=false \
+           GIT_CONFIG_KEY_4=merge.verifySignatures GIT_CONFIG_VALUE_4=false
+}
 
 # nested git repositories recorded in the index (git stores only the pointer, not the files), NUL-separated
 gitlinks() { git ls-files -s -z | grep -z '^160000 ' | sed -z 's/^[^\t]*\t//'; }
+
+unsafe_dir() {  # dir — true for $HOME, the folders above it, and folders holding SSH/GPG keys: syncing them would publish the keys
+    local d; d=$(realpath -m -- "$1")
+    [ "$d" = / ] && return 0
+    case "$(realpath -m -- "$HOME")/" in "$d"/*) return 0 ;; esac
+    [ -e "$d/.ssh" ] || [ -e "$d/.gnupg" ]
+}
 
 has_systemd() { command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; }
 
@@ -83,7 +107,7 @@ ago() {  # epoch -> "5 min", "3 hours", "2 days"
     else echo "$((s / 86400)) days"; fi
 }
 
-err_kind() {  # classify git/ssh error output
+err_kind() {  # classify git/ssh error output (git runs with LC_ALL=C, so its texts are English)
     case $1 in
         *"Identity file"*"not accessible"*)  echo nokey ;;
         *"marked as read only"*)             echo readonly ;;
@@ -95,40 +119,38 @@ err_kind() {  # classify git/ssh error output
         *"[rejected]"*|*"fetch first"*)      echo race ;;
         *"would be overwritten"*)            echo busy ;;
         *"index.lock"*)                      echo locked ;;
-        *"Could not resolve"*|*"timed out"*|*"unreachable"*|*"Connection refused"*|*"Connection reset"*|*"Connection closed"*|*"No route to host"*)
+        *"Could not resolve"*|*"timed out"*|*"unreachable"*|*"Connection refused"*|*"Connection reset"*|*"Connection closed"*| \
+        *"closed by remote host"*|*"No route to host"*|*"not responding"*|*"Broken pipe"*|*"kex_exchange_identification"*)
                                              echo offline ;;
         *)                                   echo other ;;
     esac
 }
 
-explain() {  # git/ssh error -> plain sentence; returns 1 if the problem is transient
+explain() {  # git/ssh error [net] -> plain sentence; returns 1 if transient (with "net", unknown errors count as transient)
+    local lock
     case $(err_kind "$1") in
         nokey)    echo "SSH key $(tilde "$VAULT_KEY") does not exist → vsetup" ;;
-        readonly) echo "the deploy key is read-only: on GitHub tick \"Allow write access\" → vsetup" ;;
+        readonly) echo "the deploy key is read-only: on GitHub delete it and add it again with \"Allow write access\" ticked (deploy keys can't be edited) → vsetup" ;;
         denied)   echo "GitHub rejects SSH key $(tilde "$VAULT_KEY") → vsetup" ;;
         nowrite)  echo "the key can read $(slug "$VAULT_REMOTE") but has no permission to push to it → vsetup" ;;
-        hostkey)  echo "github.com host key does not match → vsetup" ;;
+        hostkey)  echo "github.com did not show GitHub's official host key: this network may be intercepting SSH (or GitHub changed its key: update vault-sync)" ;;
         notfound) echo "repository $(slug "$VAULT_REMOTE") does not exist or the key cannot access it → vsetup" ;;
         toobig)   echo "an unpushed commit contains a file over 100 MB and GitHub rejects it: remove it from those commits (git log --stat @{u}..)" ;;
         race)     echo "GitHub changed during the sync, retrying next round"; return 1 ;;
         busy)     echo "a note changed right during the sync, retrying next round"; return 1 ;;
-        locked)   echo "git is locked: if no other git is running on the vault, delete $(tilde "$VAULT_DIR")/.git/index.lock" ;;
+        locked)   lock=$(git rev-parse --path-format=absolute --git-path index.lock 2>/dev/null)
+                  # a recent lock is another git at work (an editor, the prompt), an old one is left over from a crash
+                  if [ -n "$(find "$lock" -mmin +10 2>/dev/null)" ]; then
+                      echo "git is locked by a leftover file: if no git is running on the vault, delete $(tilde "$lock")"
+                  else
+                      echo "another git is working on the vault, retrying next round"; return 1
+                  fi ;;
         offline)  echo "GitHub unreachable (are you offline?)"; return 1 ;;
         # otherwise the last useful lines, without git's hints and ssh's fixed sentence that hides the cause
         *)        printf '%s\n' "$1" | sed -e '/^[[:space:]]*$/d' -e '/^hint:/d' -e '/Could not read from remote/d' \
-                      -e '/correct access rights/d' -e '/and the repository exists/d' | tail -n 2 | paste -sd ' ' ;;
+                      -e '/correct access rights/d' -e '/and the repository exists/d' | tail -n 2 | paste -sd ' '
+                  [ -z "${2:-}" ] || return 1 ;;
     esac
-}
-
-ensure_hostkey() {  # add github.com's official host key if missing (no blind trust)
-    local kh=$HOME/.ssh/known_hosts
-    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-    ssh-keygen -F github.com -f "$kh" 2>/dev/null | grep -qF "${GH_HOSTKEY#github.com }" || echo "$GH_HOSTKEY" >> "$kh"
-}
-
-fix_hostkey() {  # replace old or wrong github.com host keys with the official one
-    ssh-keygen -R github.com -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1
-    echo "$GH_HOSTKEY" >> "$HOME/.ssh/known_hosts"
 }
 
 add_line() {  # file line — append the line if it is missing, keeping the file newline-terminated
@@ -140,32 +162,59 @@ add_line() {  # file line — append the line if it is missing, keeping the file
 strip_block() {  # file name — remove the "# >>> name >>>" block in place, keeping the file itself (symlinks, permissions)
     local tmp
     [ -f "$1" ] && grep -q "^# >>> $2 >>>" "$1" || return 0
-    tmp=$(mktemp) && sed "/^# >>> $2 >>>/,/^# <<< $2 <<</d" "$1" > "$tmp" && cat "$tmp" > "$1"
-    rm -f "$tmp"
+    # without its end marker the block was edited by hand: deleting up to the end would take the user's lines too
+    grep -q "^# <<< $2 <<<" "$1" || { warn "$(tilde "$1"): the $2 block has lost its end marker, fix it by hand"; return 1; }
+    tmp=$(mktemp) || return 1
+    if sed "/^# >>> $2 >>>/,/^# <<< $2 <<</d" "$1" > "$tmp" && cat "$tmp" > "$1"; then rm -f "$tmp"; return 0; fi
+    rm -f "$tmp"; warn "cannot update $(tilde "$1")"; return 1
 }
 
 # ---------------------------------------------------------------- state and notifications
 save_state() {
     mkdir -p "${STATE%/*}"
-    local v; for v in ST ST_MSG ST_SINCE ST_NOTIFIED ST_LAST_OK; do printf '%s=%q\n' "$v" "${!v}"; done > "$STATE"
+    local v; for v in ST ST_MSG ST_SOFT ST_SINCE ST_NOTIFIED ST_LAST_OK ST_NID; do printf '%s=%q\n' "$v" "${!v}"; done > "$STATE"
 }
 
-desktop() {  # urgency title text — desktop notification, only when there is no terminal to show it
-    [ "$TTY" = 1 ] && return 0
-    case $VAULT_NOTIFY in none) return 0 ;; errors) [ "$1" = critical ] || return 0 ;; esac
-    # timeout: at boot the notification daemon may not be up yet, and notify-send would wait a long time
-    DISPLAY="${DISPLAY:-:0}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
-        timeout 5 notify-send -a Vault -u "$1" "$2" "$3" 2>/dev/null
+ses() {  # run a command against the desktop session; timeout: at boot the notification daemon may not be up yet
+    DISPLAY="${DISPLAY:-:0}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" timeout 5 "$@"
+}
+
+notify_owner() {  # D-Bus name of the notification daemon: it changes when the daemon restarts, and so do its ids
+    ses gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.GetNameOwner org.freedesktop.Notifications 2>/dev/null | tr -dc ':0-9.'
+}
+
+notify() {  # urgency title text [id@daemon to replace] — show a notification; prints id@daemon so it can be replaced later
+    local owner id
+    if [[ $(notify-send --help 2>/dev/null) != *--replace-id* ]]; then    # libnotify before 0.7.10: no ids
+        ses notify-send -a Vault -u "$1" "$2" "$3" 2>/dev/null; return 0
+    fi
+    owner=$(notify_owner)
+    if [ -n "${4:-}" ] && [ -n "$owner" ] && [ "${4#*@}" = "$owner" ]; then
+        id=$(ses notify-send -p -r "${4%%@*}" -a Vault -u "$1" "$2" "$3" 2>/dev/null)
+    else
+        id=$(ses notify-send -p -a Vault -u "$1" "$2" "$3" 2>/dev/null)
+        owner=$(notify_owner)    # the daemon may have just been started by this very notification
+    fi
+    [ -n "$id" ] && [ -n "$owner" ] && printf '%s@%s\n' "$id" "$owner"
     return 0
 }
 
-event() { printf '%s\n' "$1 — $2"; desktop normal "$1" "$2"; }
+desktop() {  # urgency title text [id@daemon to replace] — notification, only when there is no terminal to show it
+    [ "$TTY" = 1 ] && return 0
+    case $VAULT_NOTIFY in none) return 0 ;; errors) [ "$1" = critical ] || return 0 ;; esac
+    notify "$@"
+}
+
+event() { printf '%s\n' "$1 — $2"; desktop normal "$1" "$2" >/dev/null; }
 
 fail() {  # message [transient] — record the error, notify without spamming, and exit
-    local now notify=0; now=$(date +%s)
+    local now notify=0 id; now=$(date +%s)
     printf '%s\n' "${R}✘ Vault: $1${N}" >&2
+    # a real problem is already being reported: a round that merely failed to reach GitHub doesn't replace it
+    if [ -n "${2:-}" ] && [ "$ST" = err ] && [ -z "$ST_SOFT" ]; then exit 1; fi
     if [ "$ST" = err ] && [ "$ST_MSG" = "$1" ]; then
-        # same error as last round: remind every 4 hours, network ones only once they have lasted a day
+        # same error as last round: remind every 4 hours, transient ones only once they have lasted a day
         if [ $((now - ST_NOTIFIED)) -ge 14400 ] && { [ -z "${2:-}" ] || [ $((now - ST_SINCE)) -ge 86400 ]; }; then
             notify=1
         fi
@@ -173,16 +222,38 @@ fail() {  # message [transient] — record the error, notify without spamming, a
         ST_SINCE=$now
         [ -n "${2:-}" ] || notify=1
     fi
-    if [ $notify = 1 ]; then desktop critical "⚠ Vault not synced" "$1"; ST_NOTIFIED=$now; fi
-    ST=err ST_MSG=$1
+    if [ $notify = 1 ]; then
+        # replaces the previous error notification instead of stacking a new one on top of it
+        id=$(desktop critical "⚠ Vault not synced" "$1" "$ST_NID"); ST_NID=${id:-$ST_NID}; ST_NOTIFIED=$now
+    fi
+    ST=err ST_MSG=$1 ST_SOFT=${2:-}
     save_state
     exit 1
 }
 
+fail_git() {  # prefix git_output [net] — fail with the explained error, gently if it is transient
+    local msg soft=""
+    msg=$(explain "$2" "${3:-}") || soft=1
+    fail "$1$msg" $soft
+}
+
 sync_ok() {
-    [ "$ST" = err ] && desktop normal "✔ Vault synced again" "the earlier problem is fixed"
-    ST=ok ST_MSG="" ST_SINCE=0 ST_LAST_OK=$(date +%s)
+    if [ "$ST" = err ]; then
+        # critical notifications stay on screen until clicked: replace the stale one, even when run from a terminal
+        if [ -n "$ST_NID" ]; then
+            notify normal "✔ Vault synced again" "the earlier problem is fixed" "$ST_NID" >/dev/null
+        elif [ "$ST_NOTIFIED" -ge "$ST_SINCE" ]; then    # only if the problem had been announced
+            desktop normal "✔ Vault synced again" "the earlier problem is fixed" >/dev/null
+        fi
+    fi
+    ST=ok ST_MSG="" ST_SOFT="" ST_SINCE=0 ST_NID="" ST_LAST_OK=$(date +%s)
     save_state
+}
+
+finish() {  # problems_left — end of a sync that went through: report what was left out, or record the success
+    [ -z "$1" ] || fail "$1"
+    sync_ok
+    say "${G}✔ vault synced${N}"
 }
 
 # ---------------------------------------------------------------- sync
@@ -198,91 +269,119 @@ cmd_sync() {
     else
         flock -n 9 || exit 0
     fi
+    load_state    # another sync may have updated it while we waited
+    # stopped halfway (shutdown, systemd, Ctrl-C): recorded, so that it doesn't pass for a success
+    trap 'fail "the sync was interrupted before it could finish" 1' TERM INT HUP
 
+    unsafe_dir "$VAULT_DIR" && fail "refusing to sync $(tilde "$VAULT_DIR"): it is your home folder or holds your keys → vsetup"
     cd "$VAULT_DIR" 2>/dev/null || fail "folder $(tilde "$VAULT_DIR") does not exist → vsetup"
-    local gd branch out msg soft="" n f here there base files partial="" p
-    local -a big=()
-    gd=$(git rev-parse --git-dir 2>/dev/null) || fail "$(tilde "$VAULT_DIR") is not a git repository → vsetup"
-    # never commit in the middle of a merge/rebase: the conflict markers would end up in the commit
-    for f in MERGE_HEAD rebase-merge rebase-apply CHERRY_PICK_HEAD REVERT_HEAD; do
-        [ -e "$gd/$f" ] && fail "in $(tilde "$VAULT_DIR") a merge/rebase was left half-done: finish it (git status tells you how), then vs"
+    local gd top branch out heads p f n merging="" here there base files="" partial=""
+    local -a excl=() nested=() big=()
+    gd=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) || fail "$(tilde "$VAULT_DIR") is not a git repository → vsetup"
+    # inside another repository, git add -A would sync all of that repository
+    top=$(git rev-parse --show-toplevel 2>/dev/null)
+    [ "$top" = "$(pwd -P)" ] || fail "$(tilde "$VAULT_DIR") is not a git repository of its own, it is inside $(tilde "$top") → vsetup"
+    for f in rebase-merge rebase-apply CHERRY_PICK_HEAD REVERT_HEAD; do
+        [ -e "$gd/$f" ] && fail "in $(tilde "$VAULT_DIR") a rebase or cherry-pick was left half-done: finish or abort it (git status tells you how), then vs"
     done
-    [ -z "$(git ls-files -u | head -n 1)" ] \
-        || fail "in $(tilde "$VAULT_DIR") there are unresolved conflicts: fix them (git status lists them), then vs"
+    if [ -e "$gd/MERGE_HEAD" ]; then
+        # a conflict being resolved by hand: it is over when no conflicting note still has conflict markers
+        merging=1
+        files=$(git -c core.quotePath=false diff --name-only --diff-filter=U | while IFS= read -r p; do
+            grep -qsE '^(<<<<<<<|>>>>>>>)( |$)' -- "$p" && printf '%s\n' "$p"; done | list)
+        [ -z "$files" ] || fail "conflict markers still in $files: fix those notes, then vs"
+    elif [ -n "$(git ls-files -u | head -n 1)" ]; then
+        fail "in $(tilde "$VAULT_DIR") there are unresolved conflicts: fix them (git status lists them), git add them, then vs"
+    fi
     branch=$(git symbolic-ref --short -q HEAD) || fail "in $(tilde "$VAULT_DIR") you are not on a branch (detached HEAD): git switch main"
     git_env "$VAULT_KEY"
 
-    # folders that were nested repositories and no longer are: back to being saved file by file
-    while IFS= read -r -d '' p; do [ -e "$p/.git" ] || git rm -q --cached -- "$p"; done < <(gitlinks)
-    out=$(git add -A 2>&1) || fail "$(explain "$out")"
-    # GitHub rejects files over 100 MB: once in a commit, they would block every later push
+    # what git add must never take: nested repositories (git would store a pointer, not their files) and
+    # files over 100 MB (GitHub refuses them, and once committed they would block every later push)
+    if [ ! -f .gitmodules ]; then    # with submodules, nested repositories are the user's business
+        while IFS= read -r -d '' p; do
+            p=${p#./}; p=${p%/.git}
+            git check-ignore -q --no-index -- "$p" || { nested+=("$p"); excl+=(":(exclude,literal)$p"); }
+        done < <(find . -path ./.git -prune -o -name .git -prune -print0)
+        # pointers recorded earlier (by an older version, or another device) go: the files are synced instead
+        while IFS= read -r -d '' p; do git --literal-pathspecs rm -q --cached -- "$p"; done < <(gitlinks)
+    fi
     while IFS= read -r -d '' p; do
-        [ "$(stat -c %s -- "$p" 2>/dev/null || echo 0)" -gt 104857600 ] && big+=("$p")
-    done < <(git diff --cached --name-only -z --diff-filter=AM)
-    if [ ${#big[@]} -gt 0 ]; then
-        git reset -q -- "${big[@]}"
-        partial="files too big for GitHub (over 100 MB), left out of the sync: $(printf '%s\n' "${big[@]}" | list) — move them out of the vault or add them to .gitignore"
-    fi
-    # a git repository inside the vault is committed as an empty pointer: its files are not saved
-    if [ ! -f .gitmodules ]; then
-        files=$(gitlinks | tr '\0' '\n' | list)
-        [ -z "$files" ] || partial="${partial:+$partial; }the files inside $files do not reach GitHub because it is a nested git repository: move it out of the vault or delete its .git folder"
-    fi
-    if ! git diff --cached --quiet; then
+        p=${p#./}
+        for f in "${nested[@]}"; do [[ $p == "$f"/* ]] && continue 2; done
+        git check-ignore -q -- "$p" && continue
+        # LFS (or any clean filter) stores something else than the file itself
+        case $(git check-attr filter -- "$p") in *": filter: unspecified") ;; *) continue ;; esac
+        big+=("$p"); excl+=(":(exclude,literal)$p")
+    done < <(find . -name .git -prune -o -type f -size +100M -print0)
+    out=$(git add -A -- . "${excl[@]}" 2>&1) || fail_git "" "$out"
+    # and nothing over the limit that was staged by hand: measured on the blobs that would be committed
+    while IFS= read -r p; do
+        git --literal-pathspecs reset -q -- "$p"; big+=("$p")
+    done < <(git diff --cached --no-renames --diff-filter=AM --raw -z | while IFS= read -r -d '' f && IFS= read -r -d '' p; do
+                 read -r _ _ _ f _ <<<"$f"; printf '%s %s\n' "$f" "$p"
+             done | git cat-file --batch-check='%(objectsize) %(rest)' | awk '$1 > 104857600 { sub(/^[0-9]+ /, ""); print }')
+    [ ${#big[@]} -eq 0 ] || partial="files too big for GitHub (over 100 MB), left out of the sync: $(printf '%s\n' "${big[@]}" | sort -u | list) — move them out of the vault or add them to .gitignore"
+    [ ${#nested[@]} -eq 0 ] || partial="${partial:+$partial; }the files inside $(printf '%s\n' "${nested[@]}" | list) do not reach GitHub because it is a nested git repository: move it out of the vault or delete its .git folder"
+
+    if [ -n "$merging" ] || ! git diff --cached --quiet; then
         n=$(git diff --cached --name-only | wc -l)
-        out=$(git commit -q -m "vault: $(date '+%F %T') [$(hostname -s)]" 2>&1) || fail "commit failed: $(explain "$out")"
-        say "✔ committed $n file(s)"
-    fi
-    if ! git rev-parse -q --verify HEAD >/dev/null; then
-        [ -z "$partial" ] || fail "$partial"
-        sync_ok; say "vault empty, nothing to sync"; return 0
+        out=$(git commit -q -m "vault: $(date '+%F %T') [$(hostname -s)]" 2>&1) || fail_git "commit failed: " "$out"
+        if [ -n "$merging" ]; then say "✔ merge with GitHub completed"; else say "✔ committed $n file(s)"; fi
     fi
 
     if ! out=$(git fetch -q origin "$branch" 2>&1); then
-        if [[ $out == *"couldn't find remote ref"* ]]; then   # GitHub repo still empty
-            out=$(git push -q -u origin "$branch" 2>&1) || { msg=$(explain "$out") || soft=1; fail "push failed: $msg" $soft; }
-            [ -z "$partial" ] || fail "$partial"
-            sync_ok; say "${G}✔ first push to GitHub done${N}"; return 0
+        [[ $out == *"couldn't find remote ref"* ]] || fail_git "" "$out" net
+        heads=$(git ls-remote --heads origin 2>&1) || fail_git "" "$heads" net
+        if [ -z "$heads" ]; then    # GitHub repository still empty: the first push creates the branch
+            if git rev-parse -q --verify HEAD >/dev/null; then
+                out=$(git push -q -u origin "$branch" 2>&1) || fail_git "push failed: " "$out" net
+                say "${G}✔ first push to GitHub done${N}"
+            fi
+            finish "$partial"; return 0
         fi
-        msg=$(explain "$out") || soft=1
-        fail "$msg" $soft
+        # the vault is on another branch on GitHub: follow it if nothing was committed here yet, otherwise ask
+        p=$(git ls-remote --symref origin HEAD 2>/dev/null | sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p')
+        if git rev-parse -q --verify HEAD >/dev/null || [ -z "$p" ]; then
+            fail "on GitHub the vault is on branch ${p:-another branch}, here on $branch: cd $(tilde "$VAULT_DIR") && git branch -m $branch ${p:-<that branch>}, then vs"
+        fi
+        git symbolic-ref HEAD "refs/heads/$p"; branch=$p
+        out=$(git fetch -q origin "$branch" 2>&1) || fail_git "" "$out" net
     fi
 
-    here=$(git rev-parse HEAD)
-    there=$(git rev-parse "origin/$branch")
-    base=$(git merge-base HEAD "origin/$branch") \
-        || fail "the local history and GitHub's have nothing in common: check the repository → vsetup"
+    there=$(git rev-parse "refs/remotes/origin/$branch")
+    if ! here=$(git rev-parse -q --verify HEAD); then
+        # nothing committed here yet: take GitHub's vault as it is
+        out=$(git checkout -q -B "$branch" "refs/remotes/origin/$branch" 2>&1) || fail_git "" "$out"
+        git branch -q --set-upstream-to="refs/remotes/origin/$branch"
+        event "⬇ Vault downloaded" "the notes on GitHub are now in $(tilde "$VAULT_DIR")"
+        finish "$partial"; return 0
+    fi
+    base=$(git merge-base HEAD "refs/remotes/origin/$branch") \
+        || fail "the history here and the one on GitHub have nothing in common: is $(slug "$VAULT_REMOTE") really this vault? If so: cd $(tilde "$VAULT_DIR") && git merge --allow-unrelated-histories origin/$branch, fix any conflict, then vs"
 
     if [ "$here" = "$there" ]; then
         :
     elif [ "$here" = "$base" ]; then
-        if ! out=$(git merge -q --ff-only "origin/$branch" 2>&1); then
-            msg=$(explain "$out") || soft=1
-            fail "update from GitHub failed: $msg" $soft
-        fi
+        out=$(git merge -q --ff-only "refs/remotes/origin/$branch" 2>&1) || fail_git "update from GitHub failed: " "$out"
         event "⬇ Vault updated" "downloaded the changes from GitHub"
     else
         if [ "$there" != "$base" ]; then
-            if ! out=$(git merge -q --no-edit "origin/$branch" 2>&1); then
+            if ! out=$(git merge -q -m "vault: merge $(date '+%F %T') [$(hostname -s)]" "refs/remotes/origin/$branch" 2>&1); then
                 files=$(git -c core.quotePath=false diff --name-only --diff-filter=U | list)
-                # abort only the merge we just started; if the abort fails, the next round finds it and stops
+                # abort only the merge just started; if the abort fails, the next round finds it and stops
                 if [ -e "$gd/MERGE_HEAD" ] && ! git merge --abort 2>/dev/null; then
                     fail "the merge with GitHub failed and cannot be aborted: in $(tilde "$VAULT_DIR") check git status"
                 fi
-                if [ -z "$files" ]; then
-                    msg=$(explain "$out") || soft=1
-                    fail "merge failed: $msg" $soft
-                fi
-                fail "CONFLICT in $files: nothing is lost. To resolve: cd $(tilde "$VAULT_DIR") && git merge origin/$branch, fix the notes, git commit -a, then vs"
+                [ -n "$files" ] || fail_git "merge failed: " "$out"
+                fail "CONFLICT in $files: nothing is lost. To resolve: cd $(tilde "$VAULT_DIR") && git merge origin/$branch, fix the notes, then vs"
             fi
             event "⇅ Vault merged" "local and GitHub changes merged automatically"
         fi
-        out=$(git push -q origin "$branch" 2>&1) || { msg=$(explain "$out") || soft=1; fail "push failed: $msg" $soft; }
+        out=$(git push -q origin "$branch" 2>&1) || fail_git "push failed: " "$out" net
         say "⬆ pushed to GitHub"
     fi
-    [ -z "$partial" ] || fail "$partial"
-    sync_ok
-    say "${G}✔ vault synced${N}"
+    finish "$partial"
 }
 
 # ---------------------------------------------------------------- status
@@ -292,12 +391,15 @@ cmd_status() {
         [ -f "$CONF" ] || return 0
         if [ "$ST" = err ]; then
             printf '%s\n' "${Y}⚠  Vault not synced for $(ago "$ST_SINCE"): $ST_MSG${N}"
-        elif [ "$VAULT_INTERVAL" != 0 ] && has_systemd && ! systemctl --user is-active -q vault-sync.timer; then
-            printf '%s\n' "${Y}⚠  Vault: automatic sync is off → vault-sync apply${N}"
-        else
-            n=$(git -C "$VAULT_DIR" rev-list --count '@{u}..HEAD' 2>/dev/null) || n=0
-            [ "$n" = 0 ] || printf '%s\n' "${Y}⚠  Vault: $n commit(s) not on GitHub yet → vs${N}"
+            return 0
         fi
+        if [ "$VAULT_INTERVAL" != 0 ]; then
+            case $(timeout 2 systemctl --user is-active vault-sync.timer 2>/dev/null) in
+                inactive|failed) printf '%s\n' "${Y}⚠  Vault: automatic sync is off → vault-sync apply${N}" ;;
+            esac
+        fi
+        n=$(git -C "$VAULT_DIR" rev-list --count '@{u}..HEAD' 2>/dev/null) || n=0
+        [ "$n" = 0 ] || printf '%s\n' "${Y}⚠  Vault: $n commit(s) not on GitHub yet → vs${N}"
         return 0
     fi
 
@@ -317,7 +419,9 @@ cmd_status() {
     fi
     if [ "$VAULT_INTERVAL" = 0 ]; then
         row "Auto sync" "off, only with vs"
-    elif has_systemd && systemctl --user is-active -q vault-sync.timer; then
+    elif ! has_systemd; then
+        row "Auto sync" "${Y}no user systemd here: only with vs${N}"
+    elif systemctl --user is-active -q vault-sync.timer; then
         row "Auto sync" "${G}✔${N} every $VAULT_INTERVAL min"
     else
         row "Auto sync" "${R}✘ timer not active${N} → vault-sync apply"
@@ -349,7 +453,7 @@ write_conf() {
 }
 
 install_self() {  # the timer and the aliases always run ~/.local/bin/vault-sync, wherever this copy was downloaded
-    [ "$SELF" = "$BIN" ] && return 0
+    [ "$(readlink -f "$BIN")" = "$SELF" ] && { SELF=$BIN; return 0; }    # already it, or a symlink to it
     mkdir -p "${BIN%/*}"
     # copy, then rename: a sync running right now keeps reading the old file undisturbed
     { cp "$SELF" "$BIN.new.$$" && chmod +x "$BIN.new.$$" && mv -f "$BIN.new.$$" "$BIN"; } || die "cannot install $BIN"
@@ -365,9 +469,9 @@ vault_files() {  # ignore rules, committed so that every machine follows them
              '**/.obsidian/plugins/obsidian-git/' '.trash/'; do
         add_line "$VAULT_DIR/.gitignore" "$e"
     done
-    # Obsidian's UI state changes on every click: tracked, it would flood the commits and cause conflicts
-    git -C "$VAULT_DIR" rm -q --cached --ignore-unmatch -- \
-        ':(glob)**/.obsidian/workspace.json' ':(glob)**/.obsidian/workspace-mobile.json'
+    # Obsidian's desktop UI state changes on every click: tracked, it floods the commits and causes conflicts
+    # (workspace-mobile.json stays tracked if it is: only phones change it, untracking it would clash with them)
+    git -C "$VAULT_DIR" rm -q --cached --ignore-unmatch -- ':(glob)**/.obsidian/workspace.json'
     say "✔ .gitignore: workspace.json and the trash stay out of the sync"
 }
 
@@ -378,8 +482,9 @@ install_timer() {
     fi
     if [ "$VAULT_INTERVAL" != 0 ]; then
         mkdir -p "$UNITS"
+        # no TimeoutStartSec: a big upload on a slow line must be allowed to finish (ssh has its own timeouts)
         printf '%s\n' "[Unit]" "Description=Sync the Obsidian vault with GitHub (vault-sync)" "" \
-            "[Service]" "Type=oneshot" "ExecStart=\"$SELF\"" "TimeoutStartSec=5min" > "$UNITS/vault-sync.service"
+            "[Service]" "Type=oneshot" "ExecStart=$(sq "$SELF")" > "$UNITS/vault-sync.service"
         printf '%s\n' "[Unit]" "Description=Sync the vault every $VAULT_INTERVAL minutes (vault-sync)" "" \
             "[Timer]" "OnActiveSec=2min" "OnUnitActiveSec=${VAULT_INTERVAL}min" "" \
             "[Install]" "WantedBy=timers.target" > "$UNITS/vault-sync.timer"
@@ -402,31 +507,35 @@ install_timer() {
     fi
 }
 
-install_shell() {  # managed block in .zshrc, rewritten every time
-    local q tmp rc; q=$(printf %q "$SELF")
+install_shell() {  # managed block at the end of the shell rc, rewritten every time
+    local q rc; q=$(sq "$SELF")
     # the old setup.sh wrote its own block, in both rc files
-    for rc in "${ZDOTDIR:-$HOME}/.zshrc" "$HOME/.bashrc"; do strip_block "$rc" obsidian-vault-sync; done
-    tmp=$(mktemp) || return 1
-    [ -f "$RC" ] && sed '/^# >>> vault-sync >>>/,/^# <<< vault-sync <<</d' "$RC" > "$tmp"
-    if [ "$VAULT_SHELL" = 1 ]; then
+    for rc in "${ZDOTDIR:-$HOME}/.zshrc" "$HOME/.bashrc"; do strip_block "$rc" obsidian-vault-sync || return 1; done
+    strip_block "$RC" vault-sync || return 1
+    if [ "$VAULT_SHELL" != 1 ]; then say "✔ no aliases in $(tilde "$RC")"; return 0; fi
+    {
+        [ -s "$RC" ] && [ -n "$(tail -c 1 "$RC")" ] && echo    # the rc may not end with a newline
         printf '%s\n' "# >>> vault-sync >>> (generated by vault-sync configure: do not edit by hand)" \
+            'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' \
             "alias vs=$q" "alias vsetup=\"$q configure\"" "[ -x $q ] && $q status --brief" \
-            "# <<< vault-sync <<<" >> "$tmp"
-    fi
-    if [ -f "$RC" ] || [ -s "$tmp" ]; then cmp -s "$tmp" "$RC" || cat "$tmp" > "$RC"; fi
-    rm -f "$tmp"
-    if [ "$VAULT_SHELL" = 1 ]; then say "✔ vs and vsetup aliases in $(tilde "$RC") (active from the next terminal)"
-    else say "✔ no aliases in $(tilde "$RC")"; fi
+            "# <<< vault-sync <<<"
+    } >> "$RC" || { warn "cannot write $(tilde "$RC")"; return 1; }
+    say "✔ vs and vsetup aliases in $(tilde "$RC") (active from the next terminal)"
 }
 
 cmd_apply() {
     [ -f "$CONF" ] || die "no saved configuration: run vault-sync configure"
-    local owner=${VAULT_REMOTE#git@github.com:}; owner=${owner%%/*}
+    [[ $VAULT_INTERVAL =~ ^[0-9]+$ ]] \
+        || die "VAULT_INTERVAL in $(tilde "$CONF") must be a number of minutes (0 = only by hand), not \"$VAULT_INTERVAL\""
+    unsafe_dir "$VAULT_DIR" && die "refusing $(tilde "$VAULT_DIR") as the vault: it is your home folder or holds your keys → vault-sync configure"
+    local owner=${VAULT_REMOTE#git@github.com:} top; owner=${owner%%/*}
     install_self
-    if git -C "$VAULT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    ensure_hostkey
+    top=$(git -C "$VAULT_DIR" rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$top" ] && [ "$top" = "$(realpath -m -- "$VAULT_DIR")" ]; then
         git -C "$VAULT_DIR" remote set-url origin "$VAULT_REMOTE" 2>/dev/null \
             || git -C "$VAULT_DIR" remote add origin "$VAULT_REMOTE"
-        # git commands run by hand in the vault use the vault key too
+        # git commands run by hand in the vault use the vault key and GitHub's host key too
         git -C "$VAULT_DIR" config core.sshCommand "$(ssh_cmd "$VAULT_KEY")"
         git -C "$VAULT_DIR" config user.name  >/dev/null || git -C "$VAULT_DIR" config user.name "$owner"
         git -C "$VAULT_DIR" config user.email >/dev/null || git -C "$VAULT_DIR" config user.email "$owner@users.noreply.github.com"
@@ -434,16 +543,20 @@ cmd_apply() {
         git -C "$VAULT_DIR" config pull.rebase false
         say "✔ git: origin $(slug "$VAULT_REMOTE"), key $(tilde "$VAULT_KEY")"
         vault_files
+    elif [ -n "$top" ]; then
+        warn "$(tilde "$VAULT_DIR") is inside another git repository ($(tilde "$top")): run vault-sync configure"
     else
-        warn "$VAULT_DIR is not a git repository: run vault-sync configure"
+        warn "$(tilde "$VAULT_DIR") is not a git repository: run vault-sync configure"
     fi
-    ensure_hostkey
     install_timer
     install_shell
 }
 
 # ---------------------------------------------------------------- guided setup
+flush_input() { while read -r -t 0; do read -rsn1 _ || break; done; }   # drop keys typed ahead, like the Enter after a menu key
+
 page() {  # step title
+    flush_input
     clear
     printf '\n  %s   %s\n\n' "${B}${C}Vault Sync${N}" "${D}setup · step $1 of 7${N}"
     printf '  %s\n\n' "${B}$2${N}"
@@ -462,6 +575,7 @@ choose() {  # valid keys -> REPLY; Enter = $DEF
     local k
     while :; do
         IFS= read -rsn1 k || exit 1
+        flush_input
         [ -n "$k" ] || k=${DEF:-}
         case $k in
             q) clear; echo "Nothing saved."; exit 0 ;;
@@ -472,6 +586,7 @@ choose() {  # valid keys -> REPLY; Enter = $DEF
 }
 
 ask() {  # question initial_value -> REPLY (editable line, Enter confirms)
+    flush_input
     IFS= read -e -r -p "  $1" -i "$2" REPLY || exit 1
 }
 
@@ -519,23 +634,24 @@ obsidian_vaults() {  # existing vaults known to Obsidian (package, flatpak, snap
 }
 
 dir_desc() {
-    local o
-    if git -C "$1" rev-parse --git-dir >/dev/null 2>&1; then
-        if o=$(git -C "$1" config --get remote.origin.url); then echo "git repository · origin $o"
-        else echo "git repository without origin"; fi
+    local top o
+    if top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null); then
+        o=$(git -C "$top" config --get remote.origin.url) || o="no origin"
+        if [ "$top" = "$1" ]; then echo "git repository · origin $o"
+        else echo "inside the git repository $(tilde "$top") · origin $o"; fi
     elif [ -d "$1" ]; then echo "folder without git"
     else echo "does not exist: it will be cloned from GitHub"; fi
 }
 
 key_state() { if [ -f "$1" ]; then echo "(exists)"; else echo "(will be created)"; fi; }
 
-key_howto() {  # key kind remote open_browser — how to add the key on GitHub
+key_howto() {  # key kind remote open_browser [no_header] — how to add the key on GitHub
     local pub url clip=""
     pub=$(ssh-keygen -y -f "$1")    # from the private key: a stale or wrong .pub does not matter
     if [ "$2" = deploy ]; then url="https://github.com/$(slug "$3")/settings/keys/new"
     else url="https://github.com/settings/ssh/new"; fi
     copy_clip "$pub" && clip="   ${G}✔ already copied to the clipboard${N}"
-    echo "  ${R}✘ GitHub does not accept the key yet.${N} Add it like this:"
+    [ -n "${5:-}" ] || echo "  ${R}✘ GitHub does not accept the key yet.${N} Add it like this:"
     echo
     echo "   1. open      ${C}$url${N}"
     echo "   2. Title     vault-sync@$(hostname -s)"
@@ -553,57 +669,98 @@ key_howto() {  # key kind remote open_browser — how to add the key on GitHub
     return 0
 }
 
-adopt_remote() {  # folder with notes but no git + GitHub repo already full: merge without losing anything
-    local b
+can_write() {  # key remote — a push that cannot change anything: GitHub checks write permission before looking at refs
+    local tmp out
+    tmp=$(mktemp -d) || return 0
+    out=$(git init -q "$tmp" && cd "$tmp" && git_env "$1" && git push --dry-run -q "$2" ":refs/heads/vault-sync-write-check" 2>&1)
+    rm -rf "$tmp"
+    case $(err_kind "$out") in readonly|nowrite|denied|notfound|hostkey|nokey|offline) printf '%s\n' "$out"; return 1 ;; esac
+    return 0
+}
+
+local_name() {  # path suffix — "dir/name (local<suffix>).ext"
+    local d="" n=$1 e=""
+    [[ $n == */* ]] && { d=${n%/*}/; n=${n##*/}; }
+    [[ $n == ?*.* ]] && { e=.${n##*.}; n=${n%.*}; }
+    printf '%s%s (local%s)%s\n' "$d" "$n" "$2" "$e"
+}
+
+adopt_remote() {  # folder with notes but no git + GitHub repo already full: merge them without losing either side
+    local b f t i
+    local -a kept=()
     git -C "$1" fetch -q origin || die "cannot download the repository from GitHub"
     b=$(git -C "$1" ls-remote --symref origin HEAD | sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p')
     [ -n "$b" ] || b=main
     git -C "$1" symbolic-ref HEAD "refs/heads/$b"
-    git -C "$1" reset -q "origin/$b"    # HEAD = GitHub, the local files stay as changes
-    (cd "$1" && git ls-files -d -z | xargs -0 -r git checkout -q --)    # bring back the notes that were only on GitHub
-    git -C "$1" branch -q -u "origin/$b"
-    say "✔ local notes merged with the ones on GitHub (the differences go into the first commit)"
-}
-
-can_push() {  # dir — a push that changes nothing: proves GitHub lets this key write, not just read
-    local b out
-    b=$(git -C "$1" symbolic-ref --short -q HEAD) && git -C "$1" rev-parse -q --verify "refs/remotes/origin/$b" >/dev/null || return 0
-    out=$(git -C "$1" push --dry-run -q origin "refs/remotes/origin/$b:refs/heads/$b" 2>&1) && return 0
-    warn "GitHub does not accept pushes: $(explain "$out")"
-    return 1
+    git -C "$1" reset -q "refs/remotes/origin/$b"    # HEAD = GitHub, the local files stay as they are
+    # a file on both sides with different content: GitHub's version wins, a local note is kept next to it as a copy
+    # (Obsidian's own settings simply come from GitHub)
+    while IFS= read -r -d '' f; do
+        [ -e "$1/$f" ] || continue
+        case /$f in */.obsidian/*) git -C "$1" --literal-pathspecs checkout -q -- "$f"; continue ;; esac
+        i=1; t=$(local_name "$f" "")
+        while [ -e "$1/$t" ]; do i=$((i + 1)); t=$(local_name "$f" " $i"); done
+        mv -- "$1/$f" "$1/$t" && git -C "$1" --literal-pathspecs checkout -q -- "$f" && kept+=("$t")
+    done < <(git -C "$1" diff --name-only -z)
+    (cd "$1" && git ls-files -d -z | xargs -0 -r git --literal-pathspecs checkout -q --)    # bring back the notes that were only on GitHub
+    git -C "$1" branch -q --set-upstream-to="refs/remotes/origin/$b"
+    say "✔ local notes merged with the ones on GitHub"
+    [ ${#kept[@]} -eq 0 ] || say "  ${#kept[@]} note(s) differed: GitHub's version kept, yours saved as \"… (local)\" next to it"
 }
 
 cmd_configure() {
     [ -t 0 ] && [ -t 1 ] || die "the setup is interactive: run it from a terminal"
-    local dir="" remote def key kind interval notify shell heads="" out verified=0 prep prep_txt d o c seen i keys
-    local -a cands=() ivals=(5 15 30 60 0) nvals=(all errors none)
+    local dir="" remote def key kind interval notify shell heads="" out verified=0 prep prep_txt d o c seen i keys top json
+    local -a cands=() tops=() ivals=(5 15 30 60 0) nvals=(all errors none)
     check_deps
 
-    # 1. folder: the configured one, the vaults open in Obsidian (walked up to the repo root), ~/Vault
+    # 1. folder: the configured one, the vaults Obsidian knows, ~/Vault — one entry per git repository
     while IFS= read -r d; do
         [ -n "$d" ] || continue
-        o=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) && d=$o
-        seen=0; for c in "${cands[@]}"; do [ "$c" = "$d" ] && seen=1; done
-        [ $seen = 1 ] || cands+=("$d")
+        d=$(realpath -m -- "$d"); o=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || o=$d
+        seen=0; for c in "${tops[@]}"; do [ "$c" = "$o" ] && seen=1; done
+        [ $seen = 1 ] || { cands+=("$d"); tops+=("$o"); }
     done < <(printf '%s\n' "$VAULT_DIR"; obsidian_vaults; [ -d "$HOME/Vault" ] && echo "$HOME/Vault")
 
-    DEF=1; [ ${#cands[@]} -gt 0 ] || DEF=p
-    page 1 "Where is the vault?"
-    keys=""
-    for i in "${!cands[@]}"; do
-        [ "$i" -lt 9 ] || break
-        opt $((i + 1)) "$(tilde "${cands[$i]}")" "$(dir_desc "${cands[$i]}")"
-        keys+=$((i + 1))
+    while [ -z "$dir" ]; do
+        DEF=1; [ ${#cands[@]} -gt 0 ] || DEF=p
+        page 1 "Where is the vault?"
+        keys=""
+        for i in "${!cands[@]}"; do
+            [ "$i" -lt 9 ] || break
+            opt $((i + 1)) "$(tilde "${cands[$i]}")" "$(dir_desc "${cands[$i]}")"
+            keys+=$((i + 1))
+        done
+        opt p "Another folder" "even one that doesn't exist yet: it will be cloned from GitHub"
+        foot; choose "${keys}p"
+        if [ "$REPLY" = p ]; then
+            echo; ask "folder: " "$HOME/"
+            [ -z "$REPLY" ] || dir=$(realpath -m -- "${REPLY/#\~/$HOME}" 2>/dev/null)
+        else
+            dir=${cands[$((REPLY - 1))]}
+        fi
+        [ -n "$dir" ] || continue
+        # the vault is a repository of its own: a folder inside another repository means syncing all of that one
+        top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
+        if [ -n "$top" ] && [ "$top" != "$dir" ]; then
+            o=$(git -C "$top" config --get remote.origin.url) || o="no origin"
+            page 1 "That folder is inside another git repository"
+            echo "  $(tilde "$dir") is part of $(tilde "$top") ($o)."
+            echo "  Making it the vault means syncing all of $(tilde "$top"), every file in it."
+            echo
+            DEF=""; opt y "Sync all of $(tilde "$top")"; opt n "Choose another folder"
+            foot; choose yn
+            if [ "$REPLY" = y ]; then dir=$top; else dir=""; continue; fi
+        fi
+        if unsafe_dir "$dir"; then
+            page 1 "Not that folder"
+            echo "  ${R}$(tilde "$dir") is your home folder, a folder above it, or holds SSH/GPG keys:${N}"
+            echo "  syncing it would push your keys and private files to GitHub."
+            echo
+            DEF=n; opt n "Choose another folder"; foot; choose n
+            dir=""
+        fi
     done
-    opt p "Another folder" "even one that doesn't exist yet: it will be cloned from GitHub"
-    foot; choose "${keys}p"
-    if [ "$REPLY" = p ]; then
-        echo
-        while [ -z "$dir" ]; do ask "folder: " "$HOME/"; dir=$(realpath -m -- "${REPLY/#\~/$HOME}" 2>/dev/null); done
-        o=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) && dir=$o
-    else
-        dir=${cands[$((REPLY - 1))]}
-    fi
 
     # 2. repository
     def=""
@@ -619,6 +776,16 @@ cmd_configure() {
         remote=$(norm_remote "$REPLY") && break
         echo "  ${R}not recognized${N}: write it as user/repo, for example alice/notes"
         def=$REPLY
+    done
+    # a public repository would publish every note: say so before anything is pushed
+    while command -v curl >/dev/null && json=$(curl -fsS -m 5 "https://api.github.com/repos/$(slug "$remote")" 2>/dev/null) \
+          && [[ $json == *'"private": false'* ]]; do
+        page 2 "This repository is public"
+        echo "  ${R}Anyone can read https://github.com/$(slug "$remote"): every note you sync would be public.${N}"
+        echo "  Make it private on GitHub (Settings → Danger Zone → Change visibility), or start over with another one."
+        echo
+        DEF=""; opt c "Check again"; opt y "Use it anyway"; foot; choose cy
+        [ "$REPLY" = y ] && break
     done
 
     # 3. SSH key
@@ -647,27 +814,34 @@ cmd_configure() {
             echo
             echo "  ${R}$(tilde "$key") is passphrase-protected (or not a valid key).${N}"
             echo "  The automatic sync runs unattended and cannot unlock it: choose the dedicated key."
-            echo; echo "  ${D}press any key...${N}"; read -rsn1 || exit 1
+            echo; echo "  ${D}press any key...${N}"; flush_input; read -rsn1 || exit 1
             continue
         fi
         [ -f "$key.pub" ] || ssh-keygen -y -f "$key" > "$key.pub"
         break
     done
 
-    # 3b. check that GitHub accepts the key, and if not explain how to add it
+    # 3b. check that GitHub lets the key read and write, and if not explain how to fix it
     ensure_hostkey
-    local can_skip=0 opened=0 hostfixed=0
+    local can_skip=0 opened=0
     git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 && can_skip=1
     while :; do
         page 3 "Checking access to GitHub..."
         if out=$(git_env "$key"; git ls-remote --heads "$remote" 2>&1); then
-            verified=1; heads=$out; break
+            heads=$out
+            out=$(can_write "$key" "$remote") && { verified=1; break; }
         fi
-        if [ "$(err_kind "$out")" = hostkey ] && [ $hostfixed = 0 ]; then fix_hostkey; hostfixed=1; continue; fi
         page 3 "Connect the key to GitHub"
         case $(err_kind "$out") in
             denied|nokey)
                 key_howto "$key" "$kind" "$remote" $((opened == 0)); opened=1 ;;
+            readonly)
+                echo "  ${R}✘ GitHub lets this deploy key read, but not write.${N} Deploy keys can't be edited:"
+                echo "  delete it on ${C}https://github.com/$(slug "$remote")/settings/keys${N}, then add it again:"
+                key_howto "$key" "$kind" "$remote" $((opened == 0)) no_header; opened=1 ;;
+            nowrite)
+                echo "  ${R}✘ This key's account can read $(slug "$remote") but has no permission to push to it.${N}"
+                echo "  Use the dedicated deploy key (press r and start over), or get write access to the repository." ;;
             notfound)
                 echo "  ${R}✘ GitHub accepts the key, but cannot find the repository $(slug "$remote").${N}"
                 echo
@@ -678,8 +852,8 @@ cmd_configure() {
             offline)
                 echo "  ${R}✘ GitHub is not reachable.${N} Check the connection and try again." ;;
             hostkey)
-                echo "  ${R}✘ github.com's host key does not match the official one.${N}"
-                echo "  You may be on a network that intercepts SSH: try again from another network." ;;
+                echo "  ${R}✘ github.com did not show GitHub's official host key.${N}"
+                echo "  This network may be intercepting SSH: try again from another one." ;;
             *)
                 echo "  ${R}✘ Unexpected error:${N}"
                 printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 5 | sed 's/^/    /' ;;
@@ -687,7 +861,7 @@ cmd_configure() {
         echo
         DEF=v
         printf '  %s  %s\n' "${B}(enter)${N}" "Done, check again"
-        [ $can_skip = 1 ] && printf '  %s      %s\n' "${B}(s)${N}" "Skip: save anyway, I'll add the key later"
+        [ $can_skip = 1 ] && printf '  %s      %s\n' "${B}(s)${N}" "Skip: save anyway, I'll fix the key later"
         echo; foot
         if [ $can_skip = 1 ]; then choose vs; else choose v; fi
         [ "$REPLY" = s ] && break
@@ -705,7 +879,7 @@ cmd_configure() {
 
     # 4. automatic sync
     if has_systemd; then
-        case $VAULT_INTERVAL in 5) DEF=1 ;; 30) DEF=3 ;; 60) DEF=4 ;; 0) DEF=5 ;; *) DEF=2 ;; esac
+        DEF=2; for i in "${!ivals[@]}"; do [ "${ivals[$i]}" = "$VAULT_INTERVAL" ] && DEF=$((i + 1)); done
         page 4 "How often should it sync on its own?"
         opt 1 "Every 5 minutes"; opt 2 "Every 15 minutes"; opt 3 "Every 30 minutes"; opt 4 "Every hour"
         opt 5 "Never" "only when you run vs"
@@ -716,7 +890,7 @@ cmd_configure() {
     fi
 
     # 5. notifications
-    case $VAULT_NOTIFY in errors) DEF=2 ;; none) DEF=3 ;; *) DEF=1 ;; esac
+    DEF=1; for i in "${!nvals[@]}"; do [ "${nvals[$i]}" = "$VAULT_NOTIFY" ] && DEF=$((i + 1)); done
     page 5 "Which desktop notifications do you want?"
     opt 1 "Errors and updates" "«⚠ Vault not synced», «⬇ Vault updated»"
     opt 2 "Errors only"
@@ -737,8 +911,8 @@ cmd_configure() {
     row "Vault"      "$(tilde "$dir")  ${D}$prep_txt${N}"
     row "Repository" "$(slug "$remote")"
     row "Key"        "$(tilde "$key")  ${D}$(kind_label "$kind")${N}"
-    if [ $verified = 1 ]; then row "Access" "${G}✔ verified${N}"
-    else row "Access" "${Y}⚠ key not on GitHub yet: syncing will fail until you add it${N}"; fi
+    if [ $verified = 1 ]; then row "Access" "${G}✔ verified: GitHub lets this key read and write${N}"
+    else row "Access" "${Y}⚠ not verified: syncing will fail until GitHub accepts the key${N}"; fi
     if [ "$interval" = 0 ]; then row "Auto sync" "no, only with vs"; else row "Auto sync" "every $interval minutes"; fi
     case $notify in all) row "Notifications" "errors and updates" ;; errors) row "Notifications" "errors only" ;; *) row "Notifications" "none" ;; esac
     if [ "$shell" = 1 ]; then row "Terminal" "vs, vsetup and warning in $(tilde "$RC")"; else row "Terminal" "nothing"; fi
@@ -763,8 +937,7 @@ cmd_configure() {
     write_conf && say "✔ configuration saved to $(tilde "$CONF")"
     cmd_apply
     echo
-    if ( cmd_sync ) && can_push "$dir"; then
-        say "✔ GitHub accepts pushes from this key"
+    if ( cmd_sync ); then
         echo; say "  ${G}${B}All set.${N}"
     else
         echo; warn "not working yet: read the message above, fix it and run vsetup again"
